@@ -1,0 +1,61 @@
+{
+  "archive": "E:\\DLAM_TCN_TFT\\final_submission.zip",
+  "archive_bytes": 483803778,
+  "archive_megabytes": 461.39,
+  "files": 15,
+  "crc_check": "passed",
+  "validation_rows": 32256,
+  "max_prediction_difference": 1.9030969670311997,
+  "mean_prediction_difference": 0.16765688036719253,
+  "component_differences": {
+    "prediction_tft": {
+      "max": 3.552713678800501e-15,
+      "mean": 2.0830449358356422e-17
+    },
+    "prediction_tcn": {
+      "max": 8.900960288826809e-06,
+      "mean": 4.5154067838746887e-07
+    },
+    "prediction_chronos": {
+      "max": 5.954687,
+      "mean": 0.46759635817091394
+    }
+  },
+  "canonical_validation_csv": "E:\\DLAM_TCN_TFT\\recommended_validation_predictions_SUBMISSION_MODEL.csv",
+  "deterministic_chronos_audit": {
+    "reason": "Chronos re-audit after explicitly setting eval mode and merging LoRA",
+    "chronos_quantile": 0.56,
+    "model_order": [
+      "TFT",
+      "TCN_three_seed",
+      "Chronos2"
+    ],
+    "week1_three_model_weights": [
+      0.515289224450214,
+      0.10396404618533088,
+      0.3807467293644552
+    ],
+    "week1_three_model_wape": 0.13513207734141688,
+    "week2_two_model_wape": 0.11595418114523146,
+    "week2_three_model_wape": 0.11329902466051811,
+    "week2_gain": 0.0026551564847133446,
+    "full_two_model_weights": [
+      0.777,
+      0.22299999999999998
+    ],
+    "full_two_model_wape": 0.1255917687638482,
+    "full_three_model_weights": [
+      0.4776875864479334,
+      0.11994678480347451,
+      0.40236562874859216
+    ],
+    "full_three_model_wape": 0.12268127385462986,
+    "chronos_accepted": true,
+    "final_submission_weights": [
+      0.4776875864479334,
+      0.11994678480347451,
+      0.40236562874859216
+    ]
+  },
+  "offline_environment_flags": true
+}

@@ -1,0 +1,14 @@
+torch==2.5.1
+numpy==1.26.4
+pandas==2.2.2
+lightning==2.2.5
+pytorch-forecasting==1.8.0
+chronos-forecasting==2.3.1
+transformers==4.57.6
+peft==0.18.1
+accelerate==1.14.0
+einops==0.8.2
+safetensors==0.8.0
+scikit-learn==1.6.1
+scikit-base==1.0.2
+
