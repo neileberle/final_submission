@@ -31,7 +31,7 @@ uv pip install -r requirements.txt
 
 Run the code
 ```bash
-python predict.py --input_dir /data/input --output_file /output/predictions.csv --checkpoint /submission/checkpoint.pt
+uv run python predict.py --input_dir /data/input --output_file /output/predictions.csv --checkpoint /submission/checkpoint.pt
 ```
 
 
