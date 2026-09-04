@@ -68,6 +68,43 @@ def _torch_load(path: Path, map_location: str | torch.device = "cpu") -> Any:
         return torch.load(path, map_location=map_location)
 
 
+def _make_asset_resolver(checkpoint_path: Path):
+    """Resolve manifest-relative asset paths regardless of where the manifest sits.
+
+    The checkpoint manifest stores paths like ``src/assets/tft/...`` relative to
+    the submission root. Historically the manifest lived at that root, but it is
+    also valid to keep it in a ``submission/`` subfolder (as the required command
+    ``--checkpoint /submission/checkpoint.pt`` implies). Try a series of candidate
+    base directories and use the first one that actually contains the asset.
+    """
+    checkpoint_path = checkpoint_path.resolve()
+    package_root = Path(__file__).resolve().parent.parent
+    candidates: list[Path] = []
+    for base in (
+        checkpoint_path.parent,
+        checkpoint_path.parent.parent,
+        package_root,
+        package_root.parent,
+        Path.cwd(),
+    ):
+        base = base.resolve()
+        if base not in candidates:
+            candidates.append(base)
+
+    def resolve(relative: str) -> Path:
+        relative_path = Path(relative)
+        for base in candidates:
+            candidate = (base / relative_path).resolve()
+            if candidate.exists():
+                return candidate
+        tried = "\n  ".join(str(base / relative_path) for base in candidates)
+        raise FileNotFoundError(
+            f"Could not locate manifest asset {relative!r}. Tried:\n  {tried}"
+        )
+
+    return resolve
+
+
 def _release_cuda() -> None:
     gc.collect()
     if torch.cuda.is_available():
@@ -141,7 +178,15 @@ def _load_inputs(input_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFr
     counts = forecast_index.groupby(ID).size()
     if counts.nunique() != 1 or int(counts.iloc[0]) != 336:
         raise ValueError(f"Expected 336 forecast rows per series, got {counts.unique()}")
-    if set(forecast_index[ID].unique()) != set(history[ID].unique()):
+
+
+    # if set(forecast_index[ID].unique()) != set(history[ID].unique()):
+    # This demands an exact set match between the series in your history file and the series in the forecast index. 
+    # That's fine if train.csv always contains precisely the series being evaluated — but if the private test phase 
+    # only asks you to forecast a subset of series (say, holds out some series entirely, or reuses the full course train.csv 
+    # which may contain series beyond whatever this particular index covers), this line raises a ValueError on a perfectly valid input. You'd want:
+    
+    if not set(forecast_index[ID].unique()).issubset(history[ID].unique()):
         raise ValueError("History and forecast index contain different series IDs")
     return history, future, forecast_index
 
@@ -539,8 +584,7 @@ def run_ensemble_inference(
     if manifest.get("format") != "dlam_tft_tcn_chronos_v1":
         raise ValueError("Unsupported checkpoint manifest format")
 
-    root = checkpoint_path.parent
-    resolve = lambda relative: (root / relative).resolve()
+    resolve = _make_asset_resolver(checkpoint_path)
     history, future, forecast_index = _load_inputs(input_dir)
     device = _device()
     print(f"Inference device: {device}", flush=True)
