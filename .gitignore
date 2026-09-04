@@ -5,3 +5,9 @@ src/assets
 .venv
 
 uv.lock
+
+output
+
+data
+
+src/__pycache__
