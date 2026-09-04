@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 
 from src.inference import run_ensemble_inference
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 
 def resolve_input(p: Path) -> Path:

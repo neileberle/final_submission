@@ -126,16 +126,16 @@ def _mps_opt_in() -> bool:
 
 
 def _device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        if _mps_opt_in():
-            return torch.device("mps")
-        print(
-            "Apple MPS is available but disabled (results would diverge from the "
-            "canonical CPU predictions). Set DLAM_USE_MPS=1 to enable it.",
-            flush=True,
-        )
+    # if torch.cuda.is_available():
+    #     return torch.device("cuda")
+    # if torch.backends.mps.is_available():
+    #     if _mps_opt_in():
+    #         return torch.device("mps")
+    #     print(
+    #         "Apple MPS is available but disabled (results would diverge from the "
+    #         "canonical CPU predictions). Set DLAM_USE_MPS=1 to enable it.",
+    #         flush=True,
+    #     )
     return torch.device("cpu")
 
 
