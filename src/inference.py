@@ -68,14 +68,75 @@ def _torch_load(path: Path, map_location: str | torch.device = "cpu") -> Any:
         return torch.load(path, map_location=map_location)
 
 
-def _release_cuda() -> None:
+def _make_asset_resolver(checkpoint_path: Path):
+    """Resolve manifest-relative asset paths regardless of where the manifest sits.
+
+    The checkpoint manifest stores paths like ``src/assets/tft/...`` relative to
+    the submission root. Historically the manifest lived at that root, but it is
+    also valid to keep it in a ``submission/`` subfolder (as the required command
+    ``--checkpoint /submission/checkpoint.pt`` implies). Try a series of candidate
+    base directories and use the first one that actually contains the asset.
+    """
+    checkpoint_path = checkpoint_path.resolve()
+    package_root = Path(__file__).resolve().parent.parent
+    candidates: list[Path] = []
+    for base in (
+        checkpoint_path.parent,
+        checkpoint_path.parent.parent,
+        package_root,
+        package_root.parent,
+        Path.cwd(),
+    ):
+        base = base.resolve()
+        if base not in candidates:
+            candidates.append(base)
+
+    def resolve(relative: str) -> Path:
+        relative_path = Path(relative)
+        for base in candidates:
+            candidate = (base / relative_path).resolve()
+            if candidate.exists():
+                return candidate
+        tried = "\n  ".join(str(base / relative_path) for base in candidates)
+        raise FileNotFoundError(
+            f"Could not locate manifest asset {relative!r}. Tried:\n  {tried}"
+        )
+
+    return resolve
+
+
+def _release_accelerator() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
+def _mps_opt_in() -> bool:
+    """Apple-silicon GPU is opt-in via ``DLAM_USE_MPS=1``.
+
+    The graded run happens on a Linux CPU/CUDA container, where this never
+    fires. Locally, MPS uses different kernels and reduction orders than CPU,
+    so float32 results drift from the canonical CPU predictions recorded in
+    LOCAL_VERIFICATION.json. Keep it off for any run whose numbers you intend
+    to trust or report.
+    """
+    return os.environ.get("DLAM_USE_MPS", "0").strip().lower() in {"1", "true", "yes"}
 
 
 def _device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        if _mps_opt_in():
+            return torch.device("mps")
+        print(
+            "Apple MPS is available but disabled (results would diverge from the "
+            "canonical CPU predictions). Set DLAM_USE_MPS=1 to enable it.",
+            flush=True,
+        )
+    return torch.device("cpu")
 
 
 def _load_inputs(input_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -141,7 +202,15 @@ def _load_inputs(input_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFr
     counts = forecast_index.groupby(ID).size()
     if counts.nunique() != 1 or int(counts.iloc[0]) != 336:
         raise ValueError(f"Expected 336 forecast rows per series, got {counts.unique()}")
-    if set(forecast_index[ID].unique()) != set(history[ID].unique()):
+
+
+    # if set(forecast_index[ID].unique()) != set(history[ID].unique()):
+    # This demands an exact set match between the series in your history file and the series in the forecast index. 
+    # That's fine if train.csv always contains precisely the series being evaluated — but if the private test phase 
+    # only asks you to forecast a subset of series (say, holds out some series entirely, or reuses the full course train.csv 
+    # which may contain series beyond whatever this particular index covers), this line raises a ValueError on a perfectly valid input. You'd want:
+    
+    if not set(forecast_index[ID].unique()).issubset(history[ID].unique()):
         raise ValueError("History and forecast index contain different series IDs")
     return history, future, forecast_index
 
@@ -296,7 +365,7 @@ def _predict_tcn(
                 chunks.append(pred_real.cpu().numpy())
         seed_predictions.append(np.concatenate(chunks, axis=0))
         del model, checkpoint
-        _release_cuda()
+        _release_accelerator()
 
     averaged = np.mean(seed_predictions, axis=0)
     rows = []
@@ -384,7 +453,7 @@ def _predict_tft(
     prediction_loader = prediction_dataset.to_dataloader(
         train=False, batch_size=32, num_workers=0
     )
-    accelerator = "gpu" if device.type == "cuda" else "cpu"
+    accelerator = {"cuda": "gpu", "mps": "mps"}.get(device.type, "cpu")
     with torch.inference_mode():
         raw = model.predict(
             prediction_loader,
@@ -421,7 +490,7 @@ def _predict_tft(
     long[TIME] = minimum_time + pd.to_timedelta(long["time_idx"], unit="h")
     result = _aligned_component(forecast_index, long, "TFT")
     del model, raw, prediction_loader, prediction_dataset
-    _release_cuda()
+    _release_accelerator()
     return result
 
 
@@ -435,23 +504,78 @@ def _find_quantile_column(frame: pd.DataFrame, quantile: float):
     raise KeyError(f"Quantile {quantile} missing from Chronos output")
 
 
+def _load_packed_chronos_model(packed_dir: Path, device: torch.device):
+    """Rebuild the LoRA-merged Chronos-2 model from its int8 packed archive.
+
+    The submission ships ``chronos_int8/`` instead of base weights + LoRA
+    adapter: the adapter was merged offline and the merged weights were
+    quantised int8-symmetric per group of ``group_size`` elements
+    (``quant_manifest.json``). Weights are restored to float32 here, so the
+    model that comes out is numerically the merged fp32 model up to the
+    quantisation error recorded in the manifest.
+    """
+    import json
+
+    from safetensors.torch import load_file
+    from chronos.chronos2 import Chronos2CoreConfig, Chronos2Model
+
+    packed_dir = Path(packed_dir)
+    quant_manifest_path = packed_dir / "quant_manifest.json"
+    weights_path = packed_dir / "model.safetensors"
+    for required in (quant_manifest_path, weights_path, packed_dir / "config.json"):
+        if not required.exists():
+            raise FileNotFoundError(f"Missing packed Chronos asset: {required}")
+
+    quant_manifest = json.loads(quant_manifest_path.read_text())
+    if quant_manifest.get("format") != "chronos_int8_v1":
+        raise ValueError(
+            f"Unsupported Chronos quantisation format: {quant_manifest.get('format')!r}"
+        )
+    group_size = int(quant_manifest["group_size"])
+
+    packed = load_file(str(weights_path))
+    state: dict[str, torch.Tensor] = {}
+    for name in quant_manifest["kept"]:
+        if name not in packed:
+            raise KeyError(f"Packed Chronos archive is missing kept tensor {name!r}")
+        state[name] = packed[name].to(torch.float32)
+    for name, meta in quant_manifest["quantized"].items():
+        q = packed.get(f"{name}::q")
+        scale = packed.get(f"{name}::s")
+        if q is None or scale is None:
+            raise KeyError(f"Packed Chronos archive is missing int8 payload for {name!r}")
+        if q.shape[-1] != group_size:
+            raise ValueError(
+                f"{name!r}: group size {q.shape[-1]} does not match manifest {group_size}"
+            )
+        state[name] = (q.to(torch.float32) * scale.to(torch.float32)).reshape(
+            tuple(meta["shape"])
+        )
+    del packed
+
+    config = Chronos2CoreConfig.from_pretrained(str(packed_dir))
+    model = Chronos2Model(config)
+    model.load_state_dict(state, strict=True)
+    del state
+    model.to(device)
+    model.eval()
+    return model
+
+
 def _predict_chronos(
     history: pd.DataFrame,
     future: pd.DataFrame,
     forecast_index: pd.DataFrame,
-    base_model_dir: Path,
-    adapter_dir: Path,
+    packed_model_dir: Path,
     quantile: float,
     covariate_medians: dict[str, float],
     device: torch.device,
 ) -> pd.DataFrame:
     print("[3/3] Predicting fine-tuned Chronos-2 ...", flush=True)
-    from chronos import BaseChronosPipeline
     try:
         from chronos import Chronos2Pipeline
     except ImportError:
         from chronos.chronos2 import Chronos2Pipeline
-    from peft import PeftModel
 
     covariates = list(covariate_medians)
     missing_history = [column for column in covariates if column not in history]
@@ -485,23 +609,14 @@ def _predict_chronos(
     if chronos_history.isna().any().any() or chronos_future.isna().any().any():
         raise ValueError("Chronos preprocessing left NaN values")
 
-    base_pipeline = BaseChronosPipeline.from_pretrained(
-        str(base_model_dir),
-        device_map=device.type,
-        local_files_only=True,
-    )
-    adapted_model = PeftModel.from_pretrained(
-        base_pipeline.model,
-        str(adapter_dir),
-        local_files_only=True,
-    )
-    adapted_model.eval()
-    # Merge LoRA into the base weights for deterministic, wrapper-independent
-    # inference. The original overnight script predicted before explicitly
-    # switching the just-trained model out of train mode, so its Chronos cache
-    # contained dropout noise and is not a reproducibility reference.
-    merged_model = adapted_model.merge_and_unload()
-    merged_model.eval()
+    # The LoRA adapter was merged into the base weights offline and the merged
+    # model was shipped int8-quantised (submission archive size limit); it is
+    # restored to float32 here. Merging offline also keeps inference
+    # deterministic and wrapper-independent: the original overnight script
+    # predicted before explicitly switching the just-trained model out of train
+    # mode, so its Chronos cache contained dropout noise and is not a
+    # reproducibility reference.
+    merged_model = _load_packed_chronos_model(packed_model_dir, device)
     pipeline = Chronos2Pipeline(model=merged_model)
     raw = pipeline.predict_df(
         chronos_history,
@@ -519,8 +634,8 @@ def _predict_chronos(
     )
     frame["prediction"] = frame["prediction"].clip(lower=0.0)
     result = _aligned_component(forecast_index, frame, "Chronos")
-    del pipeline, merged_model, adapted_model, base_pipeline, raw
-    _release_cuda()
+    del pipeline, merged_model, raw
+    _release_accelerator()
     return result
 
 
@@ -539,8 +654,7 @@ def run_ensemble_inference(
     if manifest.get("format") != "dlam_tft_tcn_chronos_v1":
         raise ValueError("Unsupported checkpoint manifest format")
 
-    root = checkpoint_path.parent
-    resolve = lambda relative: (root / relative).resolve()
+    resolve = _make_asset_resolver(checkpoint_path)
     history, future, forecast_index = _load_inputs(input_dir)
     device = _device()
     print(f"Inference device: {device}", flush=True)
@@ -563,8 +677,7 @@ def run_ensemble_inference(
         history,
         future,
         forecast_index,
-        resolve(manifest["chronos_base_dir"]),
-        resolve(manifest["chronos_adapter_dir"]),
+        resolve(manifest["chronos_packed_dir"]),
         float(manifest["chronos_quantile"]),
         manifest["chronos_covariate_medians"],
         device,

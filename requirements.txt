@@ -11,4 +11,4 @@ einops==0.8.2
 safetensors==0.8.0
 scikit-learn==1.6.1
 scikit-base==1.0.2
-
+setuptools==74.1.3
